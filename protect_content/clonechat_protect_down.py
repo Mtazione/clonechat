@@ -530,7 +530,7 @@ def main():
     download_folder.mkdir(exist_ok=True)
 
     cache_folder_max_size_mb = int(
-        config_data.get("cache_folder_max_size_mb", 6000)
+        config_data.get("cache_folder_max_size_mb", 1048576)
     )
 
     download.pipe_download(
