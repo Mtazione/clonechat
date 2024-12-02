@@ -1,388 +1,425 @@
 from __future__ import annotations
 
+import collections
 import json
-import sys
-from configparser import ConfigParser
-from datetime import date
+import time
 from pathlib import Path
 from time import sleep
-from typing import Union
 
 import pyrogram
-from pyrogram.errors import ChannelInvalid, PeerIdInvalid
 
-from setup import version
-
-from .pipe import upload
-from .utils import parser
+from ..utils.csv_util import open_csv, save_csv
+from ..utils.progress_bar import progress_bar
+from ..utils.timeout import time_out
 
 
-def get_config_data(path_file_config: Path):
-    """get default configuration data from file config.ini
-
-    Returns:
-        dict: config data
-    """
-
-    config_file = ConfigParser()
-    config_file.read(path_file_config)
-    default_config = dict(config_file["default"])
-    return default_config
-
-
-def get_client(
-    client_name: str, session_folder: Path = Path(".")
-) -> pyrogram.Client:
-    """Perform the connection to Telegram and returns the client
-    not requesting ID or Password if not necessary.
-
+def get_next_to_upload(cloneplan_path: Path, loop_seconds: int = 5) -> int:
+    """returns the smallest message_id not yet cloned
+    Message_id is authorized for cloning when its clone flag = "1"
+    If all message_id have been cloned, returns value "0".
+    If there are still message_id to be cloned but at the moment
+    there are no authorized, make available available every x seconds.
     Args:
-        client_name (str): session file name
-        session_folder (Path, optional): Folder where the session file should
-            be. Defaults to Path(".").
+        cloneplan_path (Path): _description_
 
     Returns:
-        pyrogram.Client: pyrogram client
+        int: message_id. 0 If there was no more messages to clone
     """
-
-    session_path = session_folder / f"{client_name}.session"
-    print(session_path)
-    if session_path.exists():
-        try:
-            useraccount = pyrogram.Client(
-                client_name, workdir=str(session_folder)
-            )
-            useraccount.start()
-            return useraccount
-        except Exception as e:
-            Path(f"{useraccount}.session").unlink()
-            print(
-                e,
-                (
-                    "\nSession invalid. "
-                    + "Please, try again to make a new connection."
-                ),
-            )
 
     while True:
-        try:
-            api_id = int(input("Enter your api_id: "))
-            api_hash = input("Enter your api_hash: ")
+        list_data = open_csv(cloneplan_path)
+        dict_data = collections.OrderedDict(
+            sorted({int(item["id"]): item for item in list_data}.items())
+        )  # ordered from the smallest ID to the largest
 
-            useraccount = pyrogram.Client(
-                client_name, api_id, api_hash, workdir=str(session_folder)
-            )
-            useraccount.start()
-            return useraccount
-        except Exception as e:
-            print(e, "\nError. Try again.\n")
-            return None
+        # Check if everything has been cloned. If yes, it returns zero
+        clone_done = True
+        for row_data in dict_data.values():
+            if row_data["clone"] == "0":
+                clone_done = False
+                break
+        if clone_done:
+            return 0
 
-
-def get_chat_info(
-    client: pyrogram.Client, chat_input: Union[int, str]
-) -> Union[dict, bool]:
-    """Returns the chat_info (chat_id, chat_title) if chat_input is valid.
-        Returns false if it is invalid.
-    Valid chat_input: messsage_link, chat_id, invite link, chat_link,
-        chat_username
-
-    Args:
-        client (pyrogram.Client): started pyrogram client
-        chat_input (Union[int, str]): chat_id or invite link
-
-    Returns:
-        Union[dict, bool]:
-            {chat_id, chat_title}
-            or False if chat_input invalid
-    """
-
-    base_link = "https://t.me/c/"
-    if base_link in str(chat_input):
-        # if chat_input is a message link, convert to chat_id
-        base_chat_id = str(chat_input.split(base_link)[1].split("/")[0])
-        chat_input = "-100" + base_chat_id
-
-    try:
-        chat_obj = client.get_chat(chat_input)
-        chat_id = chat_obj.id
-        chat_title = chat_obj.title
-        chat_info = {"chat_id": chat_id, "chat_title": chat_title}
-        return chat_info
-    except ChannelInvalid:  # When you are not part of the channel
-        print("\nNon-accessible chat")
-        return False
-    except PeerIdInvalid as e:  # When the chat_id is invalid
-        print(f"\n{e}\nInvalid chat_input: {chat_input}")
-        return False
-    except Exception as e:
-        print(e, f"\nInvalid chat_input: {chat_input}")
+        # If not, operate in loop looking for next message_id to be cloned
+        for message_id in dict_data.keys():
+            if (
+                dict_data[message_id].get("download", "") == "1"
+                and dict_data[message_id].get("clone", "") == "0"
+            ):
+                return message_id
+        sleep(loop_seconds)
 
 
-def get_chat_info_until(client: pyrogram.Client, message: str) -> dict:
-    """Continuously requests a chat identifier to return chat information:
-    (chat_id, chat_title)
+def get_caption(message_id: int, file_path_hist: Path) -> str:
 
-    Args:
-        client (pyrogram.Client): pyrogram client
-        message (str): request message for the user
-
-    Returns:
-        dict: keys: chat_id, chat_title
-    """
-    while True:
-        return_question = input(message)
-        chat_input = (
-            int(return_question)
-            if return_question.replace("-", "").isnumeric()
-            else return_question
-        )
-        origin_chat_info = get_chat_info(client, chat_input)
-        if isinstance(origin_chat_info, dict):
+    list_dict_msg = json.loads(open(file_path_hist, "r").read())
+    caption = ""
+    for dict_msg in list_dict_msg:
+        if dict_msg["id"] == message_id:
+            caption = dict_msg.get("caption", "")
             break
-        else:
-            return_ = input(
-                "Press 'Enter' to try again or press something to close:\n"
-            )
-            if return_ == "":
-                pass
-            else:
-                sys.exit()
-
-    return origin_chat_info
+    return caption
 
 
-def get_cloneplan_path(
-    folder_path_cloneplan: Path, chat_dest_id: int, chat_dest_title: str
+def sanitize_filename(file_name: str) -> str:
+    """
+    Remove the numeric prefix and hyphen from the filename.
+
+    Args:
+        file_name (str): Original file name.
+
+    Returns:
+        str: Sanitized file name.
+    """
+    # Remove qualquer padrão inicial de número seguido por um hífen
+    import re
+    sanitized_name = re.sub(r'^\d+-\s*', '', file_name)
+    return sanitized_name
+
+
+def send_video(
+    client_name: str,
+    session_folder: Path,
+    chat_id,
+    file_path: Path,
+    caption: str,
 ) -> Path:
 
-    folder_path_cloneplan.mkdir(exist_ok=True)
-    clonechat_path = (
-        folder_path_cloneplan
-        / f"cloneplan_{str(abs(chat_dest_id))}-{chat_dest_title}.csv"
+    client = pyrogram.Client(client_name, workdir=session_folder)
+    client.start()
+
+    c_time = time.time()
+    prefix = "UP"
+    client.send_video(
+        chat_id,
+        file_path,
+        caption=caption,
+        progress=progress_bar,
+        progress_args=(c_time, prefix),
+        supports_streaming=True,
     )
-    return clonechat_path
+    client.stop()
+    return file_path
 
 
-def get_history_path(chat_title: str, chat_id: int) -> Path:
+def send_document(
+    client_name: str,
+    session_folder: Path,
+    chat_id: int,
+    file_path: Path,
+    caption: str,
+) -> Path:
 
-    log_chats_path = Path("protect_content") / "log_chats"
-    log_chats_path.mkdir(exist_ok=True)
-    folder_chat = log_chats_path / f"{str(abs(chat_id))}-{str(chat_title)}"
-    folder_chat.mkdir(exist_ok=True)
-    str_today = date.today().strftime("%Y%m%d")
-    history_path = folder_chat / f"msgs_chat_{abs(chat_id)}_{str_today}.json"
-    return history_path
+    client = pyrogram.Client(client_name, workdir=session_folder)
+    client.start()
 
-
-def save_history(client: pyrogram.Client, chat_id: int, history_path: Path):
-
-    # save history json
-    list_dict_msgs = []
-    iter_message = client.get_chat_history(chat_id)
-    for message in iter_message:
-        dict_message = json.loads(str(message))
-        list_dict_msgs.append(dict_message)
-        if len(list_dict_msgs) % 200 == 0:
-            sleep(2)
-        json.dump(
-            list_dict_msgs, open(history_path, "w", encoding="utf-8"), indent=2
-        )
-
-    print(f"The chat history was saved. {len(list_dict_msgs)} messages.")
-
-
-def get_recent_history(chat_title: str, chat_id: int) -> Path:
-
-    log_chats_path = Path("protect_content") / "log_chats"
-    log_chats_path.mkdir(exist_ok=True)
-    chat_history_name = f"{str(abs(chat_id))}-{str(chat_title)}"
-    chat_history_path = log_chats_path / chat_history_name
-    if not chat_history_path.is_dir():
-        print(
-            chat_history_name, "\nChat history not found. Waiting history..."
-        )
-        while not chat_history_path.is_dir():
-            sleep(5)
-            chat_history_path.is_dir()
-
-    recent_history = list(chat_history_path.iterdir())[-1]
-    return recent_history
-
-
-def ask_for_new_clone() -> bool:
-    print(
-        "Continue cloning or start a new one?",
-        "1 - Continue",
-        "2 - Start a new",
-        sep="\n",
+    c_time = time.time()
+    client.send_document(
+        chat_id,
+        str(file_path),
+        caption=caption,
+        progress=progress_bar,
+        progress_args=(c_time,),
     )
-    answer = input("Answer: ")
-
-    new_clone = False if answer == "1" else True
-    return new_clone
+    client.stop()
+    return file_path
 
 
-def show_history_overview(history_path: Path) -> list[str]:
-    def msgs_types():
-        str_list_types = """photo
-        text
-        document
-        sticker
-        animation
-        audio
-        voice
-        video
-        video_note
-        poll
-        service
-        dice
-        location
-        empty
-        contact"""
-        list_type = [
-            msg_type.strip() for msg_type in str_list_types.split("\n")
-        ]
-        return list_type
+def send_photo(
+    client_name: str,
+    session_folder: Path,
+    chat_id: int,
+    file_path: Path,
+    caption: str,
+) -> Path:
 
-    def get_chat_data_metrics(list_msgs):
-        total_video_duration = 0
-        total_size = 0
-        for _, msg in enumerate(list_msgs):
-            # if index == 100:
-            #     break
-            if isinstance(msg, str):
-                msg = json.loads(msg)
-            if isinstance(msg, str):
-                continue
-            if "video" in msg.keys():
-                total_video_duration += msg["video"]["duration"]
-                total_size += msg["video"]["file_size"]
-            if "document" in msg.keys():
-                total_size += msg["document"]["file_size"]
-        hours = total_video_duration // 3600
-        minutes = total_video_duration % 3600 // 60
-        seconds = total_video_duration % 60
+    client = pyrogram.Client(client_name, workdir=session_folder)
+    client.start()
 
-        return {
-            "total_video_duration": total_video_duration,
-            "hours": hours,
-            "minutes": minutes,
-            "seconds": seconds,
-            "total_size": total_size,
-        }
+    client.send_photo(
+        chat_id,
+        str(file_path),
+        caption=caption,
+    )
+    client.stop()
+    return file_path
 
-    def get_msg_type_count(list_type, list_msgs):
 
-        counter_type = {}
-        for msg in list_msgs:
-            if isinstance(msg, str):
-                msg = json.loads(msg)
-            if isinstance(msg, str):
-                continue
-            for key in msg.keys():
-                if key in list_type:
-                    value = counter_type.get(key, 0)
-                    found = True
-                    if value == 0:
-                        counter_type[key] = 1
-                    else:
-                        counter_type[key] += 1
-                    break
-            if not found:
-                print(msg["id"], " ".join(msg.keys()))
-                found = False
-        return counter_type
+def send_audio(
+    client_name: str,
+    session_folder: Path,
+    chat_id: int,
+    file_path: Path,
+    caption: str,
+) -> Path:
 
-    first_try = True
-    while True:
-        try:
-            with open(history_path, encoding="utf-8") as file:
-                list_msgs = json.load(file)
+    client = pyrogram.Client(client_name, workdir=session_folder)
+    client.start()
+
+    client.send_audio(
+        chat_id,
+        file_path,
+        caption=caption,
+    )
+    client.stop()
+    return file_path
+
+
+def send_voice(
+    client_name: str,
+    session_folder: Path,
+    chat_id: int,
+    file_path: Path,
+    caption: str,
+) -> Path:
+
+    client = pyrogram.Client(client_name, workdir=session_folder)
+    client.start()
+
+    client.send_voice(
+        chat_id,
+        file_path,
+        caption=caption,
+    )
+    client.stop()
+    return file_path
+
+
+def get_sticker_id(message_id: int, file_path_hist: Path) -> str:
+
+    list_dict_msg = json.loads(open(file_path_hist, "r").read())
+    caption = ""
+    for dict_msg in list_dict_msg:
+        if dict_msg["id"] == message_id:
+            caption = dict_msg["sticker"].get("file_id", "")
             break
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            if first_try:
-                print(
-                    f"{e}\n\nHold on... Awaiting the history file be saved..."
-                )
-                first_try = False
-            sleep(5)
-    list_type = msgs_types()
-    data_metrics = get_chat_data_metrics(list_msgs)
-    print(f"\nChat History: {history_path.parent.name}")
-    print(
-        f"duration: {data_metrics['hours']}h {data_metrics['minutes']}m "
-        + f"{data_metrics['seconds']:.1f}s"
+    return caption
+
+
+def send_sticker(
+    client_name: str, session_folder: Path, chat_id: int, sticker_id: str
+):
+
+    client = pyrogram.Client(client_name, workdir=session_folder)
+    client.start()
+
+    client.send_sticker(
+        chat_id,
+        sticker=sticker_id,
     )
-    print(f"total size: {(data_metrics['total_size'] / 1024**3):.3f} GB")
-    counter_type = get_msg_type_count(list_type, list_msgs)
-
-    print(f"msgs count by type: {json.dumps(counter_type, indent=2)}\n")
+    client.stop()
 
 
-def main():
+def get_text(message_id: int, file_path_hist: Path) -> str:
 
-    print(
-        f"\n....:: Clonechat - v{version} ::....\n"
-        + "github.com/apenasrr/clonechat/\n"
-        + "-----------Protect UP---------"
+    list_dict_msg = json.loads(open(file_path_hist, "r").read())
+    caption = ""
+    for dict_msg in list_dict_msg:
+        if dict_msg["id"] == message_id:
+            caption = dict_msg.get("text", "")
+            break
+    return caption
+
+
+def send_message(
+    client_name: str, session_folder: Path, chat_id: int, text: str
+):
+    def run_send_message(client_name, session_folder, chat_id, text):
+        client = pyrogram.Client(client_name, workdir=session_folder)
+        client.start()
+        client.send_message(
+            chat_id,
+            text=text,
+        )
+        client.stop()
+
+    try:
+        run_send_message(client_name, session_folder, chat_id, text)
+    except Exception as e:
+        print(f"\n{client_name}-{e} \n Error. Retrying to send message")
+        while True:
+            try:
+                run_send_message(client_name, session_folder, chat_id, text)
+                break
+            except Exception as e:
+                sleep(5)
+                print("...")
+
+
+def upload_media(
+    client_name: str,
+    session_folder: Path,
+    chat_id: int,
+    message_id: int,
+    cloneplan_path: Path,
+    history_path: Path,
+    auto_restart: int,
+):
+    """Cloning any message_id
+
+    Args:
+        client_name (str):
+        session_folder (Path):
+        client (pyrogram.Client): _description_
+        chat_id (int): _description_
+        message_id (int): _description_
+        cloneplan_path (Path): _description_
+        download_folder (Path): _description_
+        auto_restart (int): Restart upload if it takes longer than the definite amount of minutes
+    """
+
+    auto_restart_seconds = 60 * auto_restart
+    # file_path
+    #  get from cloneplan report because file_name is in different locations
+    #  depending the message type (video, document, photo, audio, voice)
+    list_data = open_csv(cloneplan_path)
+
+    dict_data = collections.OrderedDict(
+        sorted(
+            {int(row_data["id"]): row_data for row_data in list_data}.items()
+        )
     )
-    config_path = Path(".").absolute() / "user" / "config.ini"
-    config_data = get_config_data(path_file_config=config_path)
 
-    session_folder = Path(".").absolute()
+    # video, document, photo, audio, voice, text, sticker
+    message_type = dict_data[message_id]["type"]
 
-    up_client_name = "user_up"
-    # test_connection for upload client
-    client_up = get_client(up_client_name, session_folder=session_folder)
+    file_path = dict_data[message_id]["file_path"]
+    caption = get_caption(message_id, history_path)
 
-    message = (
-        "Enter the ORIGIN message_link, chat_id, chat_link or chat_username: "
+    # Sanitize the filename to remove the numeric prefix and hyphen
+    sanitized_name = sanitize_filename(Path(file_path).name)
+    file_path = Path(file_path).with_name(sanitized_name)
+
+    print(f"up: {sanitized_name}")
+    if message_type == "video":
+        time_out(
+            auto_restart_seconds,
+            send_video,
+            {
+                "client_name": client_name,
+                "session_folder": session_folder,
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+            },
+            True,
+        )
+
+    if message_type == "document":
+        time_out(
+            auto_restart_seconds,
+            send_document,
+            {
+                "client_name": client_name,
+                "session_folder": session_folder,
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+            },
+            True,
+        )
+    if message_type == "photo":
+        send_photo(client_name, session_folder, chat_id, file_path, caption)
+    if message_type == "audio":
+        time_out(
+            auto_restart_seconds,
+            send_audio,
+            {
+                "client_name": client_name,
+                "session_folder": session_folder,
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+            },
+            True,
+        )
+    if message_type == "voice":
+        time_out(
+            auto_restart_seconds,
+            send_voice,
+            {
+                "client_name": client_name,
+                "session_folder": session_folder,
+                "chat_id": chat_id,
+                "file_path": file_path,
+                "caption": caption,
+            },
+            True,
+        )
+    if message_type == "sticker":
+        sticker_id = get_sticker_id(message_id, history_path)
+        send_sticker(client_name, session_folder, chat_id, sticker_id)
+    if message_type == "text":
+        text = get_text(message_id, history_path)
+        send_message(client_name, session_folder, chat_id, text)
+    print("")
+
+
+def set_clone(cloneplan_path: Path, message_id: int):
+
+    list_data = open_csv(cloneplan_path)
+    for data in list_data:
+        if data["id"] == str(message_id):
+            data["clone"] = 1
+            break
+    save_csv(list_data, cloneplan_path)
+
+
+def delete_local_media(cloneplan_path: Path, message_id: int):
+
+    list_data = open_csv(cloneplan_path)
+    dict_data = collections.OrderedDict(
+        sorted(
+            {int(row_data["id"]): row_data for row_data in list_data}.items()
+        )
     )
-    chat_origin_info = get_chat_info_until(client_up, message)
-    chat_origin_title = parser.sanitize_string(chat_origin_info["chat_title"])
-    chat_origin_id = chat_origin_info["chat_id"]
-    print(f"ORIGIN: {abs(chat_origin_id)}-{chat_origin_title}\n")
-
-    message = (
-        "Enter the DESTINATION "
-        + "message_link, chat_id or chat_link or chat_username: "
-    )
-    chat_dest_info = get_chat_info_until(client_up, message)
-    chat_dest_title = parser.sanitize_string(chat_dest_info["chat_title"])
-    chat_dest_id = chat_dest_info["chat_id"]
-    print(f"DESTINATION: {abs(chat_dest_id)}-{chat_dest_title}\n")
-
-    # cloneplan_path
-    folder_path_cloneplan = Path("protect_content") / "log_cloneplan"
-    folder_path_cloneplan.mkdir(exist_ok=True)
-    cloneplan_path = get_cloneplan_path(
-        folder_path_cloneplan, chat_origin_id, chat_origin_title
-    )
-
-    history_path = get_recent_history(chat_origin_title, chat_origin_id)
-
-    show_history_overview(history_path)
-
-    # download_folder
-    cache_folder = Path("protect_content") / "Cache"
-    cache_folder.mkdir(exist_ok=True)
-    download_folder = (
-        cache_folder / f"{str(abs(chat_origin_id))}-{chat_origin_title}"
-    )
-    download_folder.mkdir(exist_ok=True)
-
-    auto_restart = int(config_data.get("auto_restart_min", 20))
-
-    upload.pipe_upload(
-        up_client_name,
-        session_folder,
-        chat_dest_id,
-        cloneplan_path,
-        history_path,
-        auto_restart,
-    )
+    file_path = dict_data[message_id]["file_path"]
+    if Path(file_path).exists() and file_path != "":
+        Path(file_path).unlink()
 
 
-if __name__ == "__main__":
-    main()
+def pipe_upload(
+    client_name: str,
+    session_folder: Path,
+    chat_id: int,
+    cloneplan_path: Path,
+    history_path: Path,
+    auto_restart: int = 20,
+):
+    """Upload all message_id in ascending order.
+    Mark in the cloneplan_path file the flag clone
+    whenever finish the upload of a file.
+
+    Args:
+        client_name (str):
+        session_folder (Path):
+        chat_id (int): _description_
+        cloneplan_path (Path): _description_
+        history_path (Path): _description_
+        auto_restart (int): Restart upload if it takes longer than the definite amount of minutes
+    """
+
+    message_id = None
+    while message_id != 0:
+        message_id = get_next_to_upload(cloneplan_path)
+        if message_id == 0:
+            print("-- Everything was uploaded :)")
+            return
+
+        upload_media(
+            client_name,
+            session_folder,
+            chat_id,
+            message_id,
+            cloneplan_path,
+            history_path,
+            auto_restart,
+        )
+        # mark flag clone in cloneplan_path file
+        set_clone(cloneplan_path, message_id)
+
+        # delete local media to release space in the cache folder
+        delete_local_media(cloneplan_path, message_id)
+
+    print("\n-- Everything was uploaded :)")
